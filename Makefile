@@ -17,10 +17,10 @@ HEX = $(BIN).hex
 all: $(HEX)
 
 $(GENERATED_HDR): generate-lut.py
-	$< >$@
+	./$< >$@
 
 $(BIN): $(SRC) $(GENERATED_HDR)
-	avr-gcc $(CFLAGS) -o $(BIN) $^
+	avr-gcc $(CFLAGS) -o $(BIN) $<
 
 $(HEX): $(BIN)
 	avr-objcopy -O ihex $< $@
@@ -32,4 +32,4 @@ fuses:
 	avrdude -p $(AVRDUDE_MCU) -c $(AVRDUDE_PROG) -U lfuse:w:$(LFUSE):m -U hfuse:w:$(HFUSE):m
 
 clean:
-	rm -f $(BIN) $(HEX)
+	rm -f $(BIN) $(HEX) $(GENERATED_HDR)
