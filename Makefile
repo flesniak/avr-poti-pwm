@@ -2,7 +2,7 @@ SRC = main.c
 GENERATED_HDR = table.h
 
 MCU = attiny13a
-CFLAGS = -s -Os -Wall -Werror -std=gnu99 -mmcu=$(MCU)
+CFLAGS = -s -Os -Wall -Werror -std=c99 -mmcu=$(MCU)
 AVRDUDE_MCU = t13
 AVRDUDE_PROG = usbasp
 
