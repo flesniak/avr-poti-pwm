@@ -2,7 +2,7 @@ SRC = main.c
 GENERATED_HDR = table.h
 
 MCU = attiny13a
-CFLAGS = -s -Os -Wall -Werror -std=c99 -mmcu=$(MCU)
+CFLAGS = -Os -fdata-sections -ffunction-sections -Wl,--gc-sections -Wall -Werror -std=c99 -mmcu=$(MCU)
 AVRDUDE_MCU = t13
 AVRDUDE_PROG = usbasp
 
@@ -23,7 +23,7 @@ $(BIN): $(SRC) $(GENERATED_HDR)
 	avr-gcc $(CFLAGS) -o $(BIN) $<
 
 $(HEX): $(BIN)
-	avr-objcopy -O ihex $< $@
+	avr-objcopy -S -O ihex $< $@
 
 flash: $(HEX)
 	avrdude -p $(AVRDUDE_MCU) -c $(AVRDUDE_PROG) -eU flash:w:$<
