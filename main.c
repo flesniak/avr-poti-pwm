@@ -14,63 +14,99 @@
 #define ADMUX_POT ((0 << REFS0) | (1 << MUX1) | (1 << MUX0)) // REFS0=0 Vcc reference 5V, PB3/ADC3
 #define WAIT_ADC_READY do {} while(ADCSRA & (1 << ADSC))
 
-ISR(TIM0_OVF_vect) {
-  ADCSRA |= (1 << ADEN); // trigger conversion at BOTTOM=T_on/2 -> gets approx. mean current
-}
-
-bool direct_pwm = false;
 uint16_t sense_target = SENSE_TARGET;
+uint16_t adc_result = 0;
+uint8_t adc_result_ready = false;
 
-void update_pwm(uint16_t adc) {
-  if (direct_pwm)
-    OCR0A = sense_target;
-  else {
-    if (adc < sense_target && OCR0A < 0xff)
-      OCR0A++;
-    else if (adc > sense_target && OCR0A > 0)
-      OCR0A--;
+ISR(ADC_vect) {
+  if (!adc_result_ready) {
+    adc_result = ADC;
+    adc_result_ready = true;
   }
 }
 
-void update_pot(uint16_t adc) {
-  direct_pwm = ((adc >> 4) < DIRECT_PWM_LIMIT);
-  sense_target = pgm_read_byte(&(brightness_lut[adc>>4]));
+// called when a new current measurement is catched
+// updates the output pwm controller
+void update_pwm() {
+  static int8_t target_diff = 0;
+  const uint16_t adc = adc_result;
+  if (adc < sense_target) {
+    if (sense_target-adc > 20) // fast adaption of high deviations
+      target_diff += 10+1;
+    else
+      target_diff++;
+  } else if (adc > sense_target) {
+    if (adc-sense_target > 20) // fast adaption of high deviations
+      target_diff -= 10+1;
+    else
+      target_diff--;
+  }
+  if (target_diff > 10 ) {
+    if (OCR0A < 0xff)
+      OCR0A++;
+    target_diff = 0;
+  } else if (target_diff < -10) {
+    if (OCR0A > 0)
+      OCR0A--;
+    target_diff = 0;
+  }
+}
+
+// called when a new potentiometer value is catched
+// sets the new target brightness
+void update_pot(uint16_t value) {
+  sense_target = pgm_read_byte(&(brightness_lut[value>>ADC_SHIFT_BITS]));
+}
+
+void adc_collect_pot_measures() {
+  static uint16_t temp = 0;
+  static uint8_t n = 0;
+  temp += adc_result;
+  n++;
+  if (n==4) {
+    update_pot(temp>>2);
+    temp = 0;
+    n = 0;
+  }
 }
 
 int main() {
-  DDRB = 0b00000001; // 5=reset, 4=current sense, 3=pot, 21=NC, 0=pwm out
-  PORTB = 0b00000110;
+  DDRB = 0b00000011; // 5=reset, 4=current sense, 3=pot, 2=NC, 1=LED, 0=pwm out
+  PORTB = 0b00000110; // pullup for NC, disable LED (active low)
 
   TCNT0 = 0;
   OCR0A = 0; // start at mosfet off
   TCCR0A = (1 << COM0A1) | (0 << COM0A0) | (0 << WGM01) | (1 << WGM00); // phase correct pwm mode, clear OC0A on compare match when up-counting, set when down-counting
-  TCCR0B = (0 << CS02) | (0 << CS01) | (1 << CS00); // no prescaler -> 9.6MHz/256 = 37.5kHz PWM clock
-  TIMSK0 = (1 << TOIE0); // overflow interrupt - triggered on MAX for phase correct pwm mode
+  TCCR0B = (0 << WGM02) | (0 << CS02) | (0 << CS01) | (1 << CS00); // no prescaler -> 9.6MHz/256/2 = 18.75kHz PWM period clock (2 runs for one pwm period)
+  DIDR0 = (1 << ADC0D) | (1 << ADC2D) | (1 << ADC3D) | (1 << ADC1D);
+  OCR0A = 100;
 
-  ADMUX = ADMUX_CUR; // start with current measure
-  ADCSRA = (1 << ADEN) | (1 << ADPS2) | (1 << ADPS1) | (0 << ADPS0);
-  while(ADCSRA & (1 << ADSC)); // wait for adc init
+  ADMUX = ADMUX_CUR; // start with current measurement
+  ADCSRA = (1 << ADEN) | (1 << ADATE) | (1 << ADIE) | (1 << ADPS2) | (0 << ADPS1) | (1 << ADPS0); // enable automatic adc triggering, prescaler 64
+  ADCSRB = (1 << ADTS2) | (0 << ADTS1) | (0 << ADTS0); // adc trigger on timer/counter overflow
+  WAIT_ADC_READY; // wait for adc init
 
   sei();
 
-  unsigned char convcount = 0;
+  uint8_t convcount = 0;
 
   while(1) {
-    sleep_mode(); // sleep until conversion is triggered
-    WAIT_ADC_READY;
-    if (convcount != CUR_PER_POT_MEASURES) {
-      update_pwm(ADC);
-      convcount++;
-      if (convcount == CUR_PER_POT_MEASURES)
-        ADMUX = ADMUX_POT; // switch to potentiometer measure
-    } else {
-      ADCSRA |= (1 << ADEN); // first measure after reference switch is inaccurate, drop it
-      WAIT_ADC_READY;
-      update_pot(ADC);
-      ADMUX = ADMUX_CUR;
-      ADCSRA |= (1 << ADEN);
-      WAIT_ADC_READY; // first measure after reference switch is inaccurate, drop it
-      convcount = 0;
+    sleep_mode(); // sleep until conversion is complete
+    if (adc_result_ready) {
+      if (convcount != CUR_PER_POT_MEASURES) {
+        update_pwm();
+        convcount++;
+        if (convcount == CUR_PER_POT_MEASURES) {
+          ADMUX = ADMUX_POT; // switch to potentiometer measurement
+          WAIT_ADC_READY;
+        }
+      } else {
+        adc_collect_pot_measures();
+        convcount = 0;
+        ADMUX = ADMUX_CUR;
+        WAIT_ADC_READY;
+      }
+      adc_result_ready = false;
     }
   }
 
