@@ -30,6 +30,9 @@ ISR(ADC_vect) {
 void update_pwm() {
   static int8_t target_diff = 0;
   const uint16_t adc = adc_result;
+  // regulator with low-pass filtering using target_diff
+  // deviations from sense_target increase target_diff
+  // OCR0A will only be modified on high values of target_diff
   if (adc < sense_target) {
     if (sense_target-adc > 20) // fast adaption of high deviations
       target_diff += 10+1;
