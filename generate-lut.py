@@ -8,19 +8,17 @@ vref=1.1
 adc_max=1023
 lut_size=256
 
-# for low_values_fixup, DEPRECATED
-# current sensing only works for sense_targets > 21 (duty cycle 30 = ~50mA)
-# all lower sense_targets will result in the same current
-min_measurable_current=0.05 # current below this value will be set to pwm without current measure
-max_direct_duty_cycle=59 # duty cycle at which min_measurable_current flows
-min_direct_duty_cycle=15 # lowest duty cycle that produces desirable results, this one will be at lut[0]
+dead_values_low=-21 # cuts the lowest 20 values
+dead_values_high=5 # repeats highest value 5 times
+# make relative lut size bigger to cut the dead values afterwards and larger for duplicate values
+lut_size_relative=lut_size-dead_values_low-dead_values_high
 
 sense_target=adc_max*shunt_ohm*current_target/vref
 sense_target_int=round(sense_target)
 print("#include <avr/pgmspace.h>\n")
 print("#define SENSE_TARGET {}".format(sense_target_int))
 print("#define LUT_SIZE {}".format(lut_size))
-print("#define ADC_SHIFT_BITS {}".format(ceil(log2(adc_max+1))-ceil(log2(lut_size))))
+print("#define ADC_SHIFT_BITS {}\n".format(ceil(log2(adc_max+1))-ceil(log2(lut_size))))
 
 # exponential growth
 # 0 at 0, sense_target at lut_size-1
@@ -48,23 +46,21 @@ def linear_lut(lut_size):
     lut.append(round(sense_target*div/(lut_size-1)))
   return lut
 
-def low_values_fixup(lut):
-  global sense_target # modify global value for algorithm
-  limit = next(x for x in lut if x > sense_target*min_measurable_current/current_target) # first entry that is above limit
-  limit_index = lut.index(limit) # index of first one not below limit
-  print("limit {} index {} limit {}".format(limit, limit_index, sense_target*min_measurable_current/current_target))
-  del lut[0:limit_index]
-  sense_target = max_direct_duty_cycle-min_direct_duty_cycle
-  newlut = linear_lut(limit_index)
-  lut[:0] = [x+min_direct_duty_cycle for x in newlut]
-  return limit_index
+def dead_values_fixup(lut, dead_low, dead_high):
+  lut = lut[(-1*dead_low if dead_low<0 else 0):(len(lut)+dead_high if dead_high<0 else len(lut))]
+  if dead_low>0:
+    lut = [lut[0]]*dead_low + lut
+  if dead_high>0:
+    lut = lut + [lut[len(lut)-1]]*dead_high
+  return lut
 
-#lut = linear_lut(lut_size)
-lut = exp_lut(lut_size)
-#lut = para_lut(lut_size)
-#print("#define DIRECT_PWM_LIMIT {}\n".format(low_values_fixup(lut)))
-print("#define DIRECT_PWM_LIMIT 0\n") # disables low value direct pwm
+#lut = linear_lut(lut_size_relative)
+lut = exp_lut(lut_size_relative)
+#lut = para_lut(lut_size_relative)
+
+lut = dead_values_fixup(lut, dead_values_low, dead_values_high)
+
 print("const uint8_t brightness_lut[{}] PROGMEM = {{".format(lut_size))
 for index, chunk in enumerate([lut[i:i+10] for i in range(0, len(lut), 10)]):
-  print("  "+",".join(str(v).rjust(3) for v in chunk)+("," if index < lut_size/10-1 else "")) # "0x{:02x}".format(v)
+  print("  "+",".join(str(v).rjust(3) for v in chunk)+("," if index < len(lut)/10-1 else ""))
 print("};")
