@@ -10,13 +10,28 @@
 #include "table.h"
 
 #define CUR_PER_POT_MEASURES 255 // 8-bit value, each n current measurements 1 potentiometer measurement is done
+#define TARGET_DIFF_THRESHOLD 16 // low-pass filter on current measurement
+#define POT_HYSTERESIS 2 // pwm won't be changed if pot changes within this hysteresis
+#define CUR_HIGH_DEVIATION 128UL // difference above a adc result is consideres "high deviation"
+#define PWM_LOCK_DEVIATION 128 // number of cycles after high current deviation
+#define PWM_LOCK_POT_CHANGE 64 // number of cycles after pot change
+#define CUR_COLLECT_LD2 2 // 2^x cur measurements will be averaged
+
+// AD register settings
 #define ADMUX_CUR ((1 << REFS0) | (1 << MUX1) | (0 << MUX0)) // REFS0=1 internal reference 1.1V, PB4/ADC2
 #define ADMUX_POT ((0 << REFS0) | (1 << MUX1) | (1 << MUX0)) // REFS0=0 Vcc reference 5V, PB3/ADC3
+
+// macros
 #define WAIT_ADC_READY do {} while(ADCSRA & (1 << ADSC))
+#define LED_ON do { PORTB &= ~(1<<PB1); } while(0)
+#define LED_OFF do { PORTB |= (1<<PB1); } while(0)
 
 uint16_t sense_target = SENSE_TARGET;
-uint16_t adc_result = 0;
-uint8_t adc_result_ready = false;
+volatile uint16_t adc_result = 0;
+volatile uint8_t adc_result_ready = false;
+uint8_t pwm_lock = 255; // pwm is not allowed to change if pwm_lock == 0
+uint8_t last_pot = 0;
+int8_t target_diff = 0;
 
 ISR(ADC_vect) {
   if (!adc_result_ready) {
@@ -27,53 +42,71 @@ ISR(ADC_vect) {
 
 // called when a new current measurement is catched
 // updates the output pwm controller
-void update_pwm() {
-  static int8_t target_diff = 0;
-  const uint16_t adc = adc_result;
+void update_pwm(void) {
   // regulator with low-pass filtering using target_diff
   // deviations from sense_target increase target_diff
   // OCR0A will only be modified on high values of target_diff
-  if (adc < sense_target) {
-    if (sense_target-adc > 20) // fast adaption of high deviations
-      target_diff += 10+1;
-    else
+  if (adc_result < sense_target) {
+    if ((sense_target-adc_result) > CUR_HIGH_DEVIATION) { // unlock pwm on high deviation
+      pwm_lock = PWM_LOCK_DEVIATION;
+      // target_diff = TARGET_DIFF_THRESHOLD;  // fast adaption
+    }
+    if (target_diff < TARGET_DIFF_THRESHOLD)
       target_diff++;
-  } else if (adc > sense_target) {
-    if (adc-sense_target > 20) // fast adaption of high deviations
-      target_diff -= 10+1;
-    else
+  } else if (adc_result > sense_target) {
+    if ((adc_result-sense_target) > CUR_HIGH_DEVIATION) { // unlock pwm high deviation
+      pwm_lock = PWM_LOCK_DEVIATION;
+      // target_diff = -1*TARGET_DIFF_THRESHOLD; // fast adaption
+    }
+    if (target_diff > -1*TARGET_DIFF_THRESHOLD)
       target_diff--;
   }
-  if (target_diff > 10 ) {
-    if (OCR0A < 0xff)
-      OCR0A++;
-    target_diff = 0;
-  } else if (target_diff < -10) {
-    if (OCR0A > 0)
-      OCR0A--;
+
+  if (pwm_lock > 0) {
+    if (target_diff >= TARGET_DIFF_THRESHOLD) {
+      if (OCR0A < 0xff) {
+          OCR0A++;
+      }
+      // target_diff -= TARGET_DIFF_THRESHOLD;
+      target_diff = 0;
+    } else if (target_diff <= -1*TARGET_DIFF_THRESHOLD) {
+      if (OCR0A > 0) {
+          OCR0A--;
+      }
+      // target_diff += -1*TARGET_DIFF_THRESHOLD;
+      target_diff = 0;
+    }
+  } else {
     target_diff = 0;
   }
 }
 
 // called when a new potentiometer value is catched
 // sets the new target brightness
-void update_pot(uint16_t value) {
-  sense_target = pgm_read_byte(&(brightness_lut[value>>ADC_SHIFT_BITS]));
+void update_pot(void) {
+  uint8_t pot = adc_result>>ADC_SHIFT_BITS;
+  if ((pot > last_pot && pot-last_pot > POT_HYSTERESIS) ||
+      (pot < last_pot && last_pot-pot > POT_HYSTERESIS)) {
+    pwm_lock = PWM_LOCK_POT_CHANGE;
+    last_pot = pot;
+  }
+  sense_target = pgm_read_byte(&brightness_lut[pot]);
 }
 
-void adc_collect_pot_measures() {
+void adc_collect_cur_measures(void) {
   static uint16_t temp = 0;
   static uint8_t n = 0;
   temp += adc_result;
   n++;
-  if (n==4) {
-    update_pot(temp>>2);
+  if (n==(1<<CUR_COLLECT_LD2)) {
+    adc_result = temp>>CUR_COLLECT_LD2;
+    update_pwm();
     temp = 0;
     n = 0;
   }
 }
 
-int main() {
+int main(void) {
   DDRB = 0b00000011; // 5=reset, 4=current sense, 3=pot, 2=NC, 1=LED, 0=pwm out
   PORTB = 0b00000110; // pullup for NC, disable LED (active low)
 
@@ -82,7 +115,6 @@ int main() {
   TCCR0A = (1 << COM0A1) | (0 << COM0A0) | (0 << WGM01) | (1 << WGM00); // phase correct pwm mode, clear OC0A on compare match when up-counting, set when down-counting
   TCCR0B = (0 << WGM02) | (0 << CS02) | (0 << CS01) | (1 << CS00); // no prescaler -> 9.6MHz/256/2 = 18.75kHz PWM period clock (2 runs for one pwm period)
   DIDR0 = (1 << ADC0D) | (1 << ADC2D) | (1 << ADC3D) | (1 << ADC1D);
-  OCR0A = 100;
 
   ADMUX = ADMUX_CUR; // start with current measurement
   ADCSRA = (1 << ADEN) | (1 << ADATE) | (1 << ADIE) | (1 << ADPS2) | (0 << ADPS1) | (1 << ADPS0); // enable automatic adc triggering, prescaler 64
@@ -96,22 +128,41 @@ int main() {
   while(1) {
     sleep_mode(); // sleep until conversion is complete
     if (adc_result_ready) {
-      if (convcount != CUR_PER_POT_MEASURES) {
-        update_pwm();
-        convcount++;
-        if (convcount == CUR_PER_POT_MEASURES) {
-          ADMUX = ADMUX_POT; // switch to potentiometer measurement
-          WAIT_ADC_READY;
-        }
-      } else {
-        adc_collect_pot_measures();
-        convcount = 0;
-        ADMUX = ADMUX_CUR;
-        WAIT_ADC_READY;
+      switch (convcount) {
+        case 249:
+          ADCSRA &= ~(1 << ADEN);
+          ADMUX = ADMUX_POT; // switch source
+          update_pwm(); // but still use this result
+          ADCSRA |= (1 << ADEN);
+          break;
+        case 250:
+          break; // throw away one result
+        case 251:
+          break; // throw away one result
+        case 252:
+          // adc_collect_pot_measures();
+          update_pot();
+          if (pwm_lock) {
+            LED_OFF;
+            pwm_lock--;
+          } else
+            LED_ON;
+          break; // throw away one result
+        case 253:
+          ADCSRA &= ~(1 << ADEN);
+          ADMUX = ADMUX_CUR;
+          ADCSRA |= (1 << ADEN);
+          break;
+        case 254:
+          break; // throw away one result
+        case 255:
+          break; // throw away one result
+        default:
+          // update_pwm();
+          adc_collect_cur_measures();
       }
+      convcount++;
       adc_result_ready = false;
     }
   }
-
-  return 0;
 }
